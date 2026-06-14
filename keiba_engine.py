@@ -3,7 +3,6 @@ from __future__ import annotations
 from contextlib import redirect_stdout
 from pathlib import Path
 import io
-import os
 import sys
 from typing import Iterable
 
@@ -20,6 +19,11 @@ import main as legacy_main  # noqa: E402
 
 
 CSV_ENCODINGS = ("utf-8-sig", "cp932")
+RESULT_CSV_CANDIDATES = (
+    DATA_DIR / "daily_race_db.csv",
+    DATA_DIR / "database" / "daily_race_db.csv",
+    DATA_DIR / "chou_haitou.csv",
+)
 
 
 class MissingInputFilesError(FileNotFoundError):
@@ -38,19 +42,10 @@ def _has_csv_files(directory: Path) -> bool:
 def find_missing_csv_files(recalc_predict_score: bool = False) -> list[Path]:
     missing: list[Path] = []
 
-    result_csv = Path(legacy_main.RESULT_CSV_FILE)
     database_dir = DATA_DIR / "database"
-
-    if not result_csv.exists():
-        missing.append(result_csv)
 
     if not _has_csv_files(database_dir):
         missing.append(database_dir / "*.csv")
-
-    if recalc_predict_score:
-        yoso_data = Path(legacy_main.YOSO_DATA_FILE)
-        if not yoso_data.exists():
-            missing.append(yoso_data)
 
     return missing
 
@@ -103,6 +98,56 @@ def _rows_to_dataframe(rows: list[dict]) -> pd.DataFrame:
     return df.drop(columns=helper_cols)
 
 
+def _read_csv_with_fallback(path: Path) -> pd.DataFrame:
+    for encoding in CSV_ENCODINGS:
+        try:
+            return pd.read_csv(path, encoding=encoding)
+        except UnicodeDecodeError:
+            continue
+    return pd.read_csv(path)
+
+
+def _latest_generated_csv() -> Path | None:
+    candidates = [path for path in RESULT_CSV_CANDIDATES if path.exists()]
+
+    database_dir = DATA_DIR / "database"
+    if database_dir.exists():
+        candidates.extend(database_dir.rglob("*.csv"))
+
+    if not candidates:
+        return None
+
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def _result_dataframe_from_csv() -> pd.DataFrame:
+    csv_path = _latest_generated_csv()
+    if csv_path is None:
+        return pd.DataFrame()
+
+    df = _read_csv_with_fallback(csv_path)
+    if df.empty:
+        return df
+
+    if "date" in df.columns:
+        latest_date = df["date"].dropna().astype(str).max()
+        if latest_date:
+            df = df[df["date"].astype(str) == latest_date].copy()
+
+    sort_columns = [col for col in ("place", "race", "rank", "horse_number") if col in df.columns]
+    for col in ("race", "rank", "horse_number"):
+        if col in sort_columns:
+            sort_col = f"_{col}_sort"
+            df[sort_col] = pd.to_numeric(df[col], errors="coerce")
+            sort_columns[sort_columns.index(col)] = sort_col
+
+    if sort_columns:
+        df = df.sort_values(sort_columns, kind="stable")
+
+    helper_columns = [col for col in df.columns if col.startswith("_") and col.endswith("_sort")]
+    return df.drop(columns=helper_columns)
+
+
 def run_prediction(
     recalc_predict_score: bool = False,
     run_heavy_reports: bool = False,
@@ -118,52 +163,14 @@ def run_prediction_with_logs(
     recalc_predict_score: bool = False,
     run_heavy_reports: bool = False,
 ) -> tuple[pd.DataFrame, str]:
-    check_required_files(recalc_predict_score=recalc_predict_score)
-
-    old_recalc = os.environ.get("RECALC_PREDICT_SCORE")
-    old_heavy = os.environ.get("RUN_HEAVY_REPORTS")
-    os.environ["RECALC_PREDICT_SCORE"] = "1" if recalc_predict_score else ""
-    os.environ["RUN_HEAVY_REPORTS"] = "1" if run_heavy_reports else ""
-
     buffer = io.StringIO()
+    with redirect_stdout(buffer):
+        legacy_main.main()
+
     try:
-        with redirect_stdout(buffer):
-            legacy_main.run_daily_builder()
-            legacy_main.cleanup_duplicate_prediction_files()
-            data = legacy_main.load_db()
+        df = _result_dataframe_from_csv()
+    except Exception as exc:
+        buffer.write(f"\nCSV読み込みエラー: {exc}\n")
+        df = pd.DataFrame()
 
-            if recalc_predict_score:
-                data = legacy_main.apply_current_predict_scores(data)
-
-            data = legacy_main.apply_roi_odds_calibration(data)
-            data = legacy_main.apply_previous_popularity_calibration(data)
-            data = legacy_main.rerank_predictions_by_score(data)
-            data = legacy_main.apply_saved_prediction_scores(data)
-
-            legacy_main.display_race_results(data)
-            legacy_main.analyze_recovery_rate(data)
-            legacy_main.analyze_top1_win_rate(data)
-
-            if run_heavy_reports:
-                legacy_main.save_performance_summary(data)
-                legacy_main.save_win_return_6x_summary(data)
-                legacy_main.save_score_and_odds_reports(data)
-                legacy_main.save_super_anchor_index_report(data)
-                legacy_main.save_top1_odds6_wide_flow_report(data)
-                legacy_main.save_trifecta_box_complete_report(data)
-                legacy_main.save_rank1_hit_report(data)
-                legacy_main.analyze_top1_place_quinella_by_score(data)
-                legacy_main.save_rank_score_finish_rates(data)
-                legacy_main.save_rank1_hit_monthly_summary(data)
-    finally:
-        if old_recalc is None:
-            os.environ.pop("RECALC_PREDICT_SCORE", None)
-        else:
-            os.environ["RECALC_PREDICT_SCORE"] = old_recalc
-
-        if old_heavy is None:
-            os.environ.pop("RUN_HEAVY_REPORTS", None)
-        else:
-            os.environ["RUN_HEAVY_REPORTS"] = old_heavy
-
-    return _rows_to_dataframe(data), buffer.getvalue()
+    return df, buffer.getvalue()
